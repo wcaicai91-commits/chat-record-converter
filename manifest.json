@@ -1,0 +1,11 @@
+{
+    "display_name": "聊天记录转换器",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "community",
+    "version": "1.0.0",
+    "homePage": ""
+}
