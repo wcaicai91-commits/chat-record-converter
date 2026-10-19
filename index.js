@@ -497,7 +497,7 @@ function openModal() {
     <div id="${MODAL_ID}" class="cc-modal-overlay">
         <div class="cc-modal">
             <div class="cc-modal-header">
-                <span>📂 聊天记录转换器（目前仅适配♦️/💜🐱，其他也可以试试）</span>
+                <span>📂 聊天记录转换器</span>
                 <button id="cc-close" class="cc-close-btn">✕</button>
             </div>
             <div class="cc-modal-body">
