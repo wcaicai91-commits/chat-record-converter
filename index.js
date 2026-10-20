@@ -134,10 +134,49 @@ function escapeRegExp(string) {
 
 function nowIso() { return new Date().toISOString(); }
 
-function isTimeLine(line) {
-    const s = line.trim();
-    const timeRegex = /^(?:星期[一二三四五六日]\s*[，,]?\s*)?\d{4}[\/\-年]\d{1,2}[\/\-月]\d{1,2}日?(?:\s*[，,]?\s*\d{1,2}:\d{2}(?::\d{2})?)?$/;
-    return timeRegex.test(s);
+// 强力名字清洗器（去空格、去括号、全小写），确保映射百分百匹配
+function cleanNameForMatch(name) {
+    return String(name).replace(/[\s\(\)（）\[\]{}【】<>《》]/g, '').toLowerCase();
+}
+
+// 提取时间，兼容各种符号和无空格情况
+function extractStandardTime(text) {
+    if (!text) return null;
+    const clean = text.replace(/[\[\]\{\}\(\)]/g, ' ').trim();
+    
+    const dateMatch = clean.match(/(\d{4})[\.\/\-年]\s*(\d{1,2})[\.\/\-月]\s*(\d{1,2})/);
+    if (!dateMatch) return null;
+
+    const year = dateMatch[1];
+    const month = String(dateMatch[2]).padStart(2, '0');
+    const day = String(dateMatch[3]).padStart(2, '0');
+
+    const timeMatch = clean.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?/i);
+    
+    if (timeMatch) {
+        let hour = parseInt(timeMatch[1], 10);
+        const minute = String(timeMatch[2]).padStart(2, '0');
+        const ampm = timeMatch[4] ? timeMatch[4].toUpperCase() : null;
+
+        if (ampm === 'PM' && hour < 12) hour += 12;
+        if (ampm === 'AM' && hour === 12) hour = 0;
+
+        const hourStr = String(hour).padStart(2, '0');
+        return `${year}/${month}/${day} ${hourStr}:${minute}`;
+    }
+
+    return `${year}/${month}/${day} 00:00`;
+}
+
+function parse2Iso(timeStr) {
+    try {
+        const parts = timeStr.split(' ');
+        const d = parts[0].split('/');
+        const t = parts[1].split(':');
+        const dateObj = new Date(parseInt(d[0]), parseInt(d[1])-1, parseInt(d[2]), parseInt(t[0]), parseInt(t[1]));
+        if (!isNaN(dateObj.getTime())) return dateObj.toISOString();
+    } catch(e) {}
+    return nowIso();
 }
 
 /* ═══════════════ 智能提取名字 ═══════════════ */
@@ -146,7 +185,6 @@ function extractNamesFromText(text) {
     const lines = text.split(/\r?\n/);
     const counts = {};
     
-    // 极其严格的黑名单，防止抓取状态栏和系统标签
     const excludes = new Set([
         '时间', '正文', '记忆区', '状态栏', '事少心情好', '地球不好混', 'IM', 'MESSAGES', 
         'Q&A', 'INTERVIEW', 'FORUM', 'ANONYMOUS', 'STM', 'LTM', 'PM', 'Core',
@@ -160,7 +198,6 @@ function extractNamesFromText(text) {
         const line = lines[i].trim();
         if (!line) continue;
 
-        // 1. <[时间](名字)> 格式提取
         const mm = line.match(/^<\[(.*?)\]\((.*?)\)>\s*(.*)$/);
         if (mm) {
             let rawName = mm[2].trim().replace(/^\(|\)$/g, '');
@@ -170,12 +207,9 @@ function extractNamesFromText(text) {
             continue;
         }
 
-        // 2. 名字: 或 名字： 格式提取
         const m = line.match(/^([^：:\n]{1,15})[：:]\s*(.*)$/);
         if (m) {
             const possibleName = m[1].trim();
-            
-            // 排除章节（第七十八节）、括号包裹、数字开头、以及黑名单词汇
             const isChapter = /^第.*?[节章卷]/.test(possibleName);
             const isBadPattern = /^[\[\(（【]/.test(possibleName) || /^[0-9]/.test(possibleName);
             
@@ -185,7 +219,6 @@ function extractNamesFromText(text) {
         }
     }
 
-    // 过滤掉出现次数太少的，至少出现2次才能被认为是高频角色
     const sorted = Object.keys(counts)
         .filter(k => counts[k] >= 2)
         .sort((a, b) => counts[b] - counts[a]);
@@ -253,14 +286,17 @@ function cleanText(text, mode, removeText, removeRules, keepRules) {
 /* ═══════════════ TXT 解析 ═══════════════ */
 
 function parseTxt(text, opts) {
-    const { detectMarkers, charName, userName, keepTime, roleMap } = opts;
-    const lines = text.split(/\r?\n/);
+    const { detectMarkers, charName, userName, keepTime, roleMap, addBbsEnd, otherMode, initialRole } = opts;
+    
+    let lines = text.split(/\r?\n/);
     const messages = [];
     let currentSpeaker = null;
     let currentText = [];
+    let lastKnownTime = null; 
+    let roleToggle = initialRole || 'char'; 
 
-    const cName = (charName || '').trim().toLowerCase();
-    const uName = (userName || '').trim().toLowerCase();
+    const cName = cleanNameForMatch(charName);
+    const uName = cleanNameForMatch(userName);
 
     const flush = () => {
         if (!currentText.length) { currentSpeaker = null; return; }
@@ -268,65 +304,93 @@ function parseTxt(text, opts) {
         currentText = [];
         if (!body) { currentSpeaker = null; return; }
 
+        // 1. 暴力洗掉所有原本可能存在的时间标签，防止污染
+        body = body.replace(/<bbs_start>[\s\S]*?<\/bbs_start>/gi, '').trim();
+        body = body.replace(/<bbs_end>[\s\S]*?<\/bbs_end>/gi, '').trim();
+
+        // 2. 如果本段没抓到时间，尝试再捞一次
+        if (!lastKnownTime) {
+            const inlineTime = extractStandardTime(body);
+            if (inlineTime) lastKnownTime = inlineTime;
+        }
+
         body = cleanText(body, opts.removeType, opts.removeText, opts.removeRules, opts.keepRules);
         if (!body) { currentSpeaker = null; return; }
 
+        let finalDate = lastKnownTime ? parse2Iso(lastKnownTime) : nowIso();
+
+        // 3. 首尾包裹，且独占一行
+        if (addBbsEnd && lastKnownTime) {
+            body = `<bbs_start>${lastKnownTime}</bbs_start>\n${body}\n<bbs_end>${lastKnownTime}</bbs_end>`;
+        }
+
         if (currentSpeaker === null) {
-            const isUser = opts.otherMode === 'user';
-            const isSystem = opts.otherMode === 'system';
-            const isIgnore = opts.otherMode === 'ignore';
-            if (!isIgnore) {
+            if (otherMode === 'system') {
+                messages.push({ name: 'System', is_user: false, is_system: true, send_date: finalDate, mes: body, extra: {} });
+            } else if (otherMode === 'ignore') {
+                // ignore
+            } else if (otherMode === 'char') {
+                messages.push({ name: charName, is_user: false, is_system: false, send_date: finalDate, mes: body, extra: {} });
+            } else if (otherMode === 'user') {
+                messages.push({ name: userName, is_user: true, is_system: false, send_date: finalDate, mes: body, extra: {} });
+            } else { // 'alternate'
+                const isUser = roleToggle === 'user';
                 messages.push({
-                    name: isUser ? userName : (isSystem ? 'System' : charName),
+                    name: isUser ? userName : charName,
                     is_user: isUser,
-                    is_system: isSystem,
-                    send_date: nowIso(),
+                    is_system: false,
+                    send_date: finalDate,
                     mes: body,
                     extra: {}
                 });
+                roleToggle = isUser ? 'char' : 'user';
             }
         } else {
-            const s = currentSpeaker.toLowerCase();
+            const s = cleanNameForMatch(currentSpeaker);
             let isUser = false;
             let isSystem = false;
             let finalName = currentSpeaker;
+            let mappedRole = roleMap[s];
 
-            // 查映射表
-            const mappedRole = roleMap[s];
             if (mappedRole === 'user') {
-                isUser = true;
-                finalName = userName;
+                isUser = true; finalName = userName;
             } else if (mappedRole === 'system') {
                 isSystem = true;
             } else if (mappedRole === 'char') {
-                isUser = false;
-                finalName = charName;
+                isUser = false; finalName = charName;
             } 
-            // 内置后备
             else if (s === '系统' || s === '旁白' || s === 'system' || s === '时间') {
                 isSystem = true;
             } else if (s === '我' || s === 'user' || (uName && s.includes(uName))) {
-                isUser = true;
-                finalName = userName;
+                isUser = true; finalName = userName;
             } else if (cName && s.includes(cName)) {
-                isUser = false;
-                finalName = charName;
+                isUser = false; finalName = charName;
             } else {
-                // 未识别
-                isUser = opts.otherMode === 'user';
-                isSystem = opts.otherMode === 'system';
+                if (otherMode === 'system') {
+                    isSystem = true;
+                } else if (otherMode === 'ignore') {
+                    currentSpeaker = null;
+                    return;
+                } else if (otherMode === 'user') {
+                    isUser = true; finalName = userName;
+                } else if (otherMode === 'char') {
+                    isUser = false; finalName = charName;
+                } else {
+                    const altIsUser = roleToggle === 'user';
+                    isUser = altIsUser;
+                    finalName = altIsUser ? userName : charName;
+                    roleToggle = altIsUser ? 'char' : 'user';
+                }
             }
 
-            if (opts.otherMode !== 'ignore' || isUser || isSystem || finalName === charName) {
-                messages.push({
-                    name: isSystem ? finalName : (isUser ? userName : charName),
-                    is_user: isUser,
-                    is_system: isSystem,
-                    send_date: nowIso(),
-                    mes: body,
-                    extra: {}
-                });
-            }
+            messages.push({
+                name: isSystem ? 'System' : finalName,
+                is_user: isUser,
+                is_system: isSystem,
+                send_date: finalDate,
+                mes: body,
+                extra: {}
+            });
         }
         currentSpeaker = null;
     };
@@ -335,17 +399,24 @@ function parseTxt(text, opts) {
         const raw = lines[i];
         const line = raw.trim();
 
-        if (keepTime && isTimeLine(line)) {
-            flush();
-            messages.push({
-                name: '时间',
-                is_user: false,
-                is_system: true,
-                send_date: nowIso(),
-                mes: `**${line}**`,
-                extra: {}
-            });
-            continue;
+        // 判断纯时间或名字+时间
+        if (keepTime && line.length < 50) {
+            const timeStr = extractStandardTime(line);
+            if (timeStr) {
+                const checkStr = line.replace(/[0-9\.\-\/ 年月日:]/g, '').trim();
+                const isPureTimeLine = checkStr.length < 5;
+
+                if (isPureTimeLine) {
+                    if (currentText.length > 0) flush();
+                    lastKnownTime = timeStr; 
+                    continue;
+                } else if (!line.includes('：') && !line.includes(':')) {
+                    if (currentText.length > 0) flush();
+                    lastKnownTime = timeStr; 
+                    currentText.push(raw); 
+                    continue;
+                }
+            }
         }
 
         if (!line) {
@@ -355,38 +426,39 @@ function parseTxt(text, opts) {
         
         if (/^-\s*"[^"]*"\s*拍了拍\s*"[^"]*"\s*-$/.test(line)) continue;
 
-        // 严格强切格式1
+        // 只认名字，绝对不读 <> 里的时间
         if (detectMarkers) {
             const mm = line.match(/^<\[(.*?)\]\((.*?)\)>\s*(.*)$/);
             if (mm) {
-                flush();
+                if (currentText.length > 0) flush();
+                
                 let rawName = mm[2].trim();
                 if (rawName.startsWith('(') && rawName.endsWith(')')) {
                     rawName = rawName.substring(1, rawName.length - 1).trim();
                 }
                 currentSpeaker = rawName;
+
                 if (mm[3].trim()) currentText.push(mm[3]);
                 continue;
             }
         }
 
-        // 严格强切格式2
-        const m = line.match(/^([^：:\n]{1,30})[：:]\s*(.*)$/);
+        const m = line.match(/^([^：:\n]{1,15})[：:]\s*(.*)$/);
         if (m) {
             const possibleName = m[1].trim();
-            const lowerPos = possibleName.toLowerCase();
+            const lowerPos = cleanNameForMatch(possibleName);
             
             const isChapter = /^第.*?[节章卷]/.test(possibleName);
             const isExcluded = ['时间', '正文', '记忆区', '状态栏', '事少心情好', '地球不好混', 'IM', 'MESSAGES', 'Q&A', 'INTERVIEW', 'FORUM', 'ANONYMOUS', 'STM', 'LTM', 'PM', 'Core'].includes(possibleName);
             
             let isKnown = false;
-            if (roleMap[lowerPos]) isKnown = true;
-            if (cName && lowerPos.includes(cName)) isKnown = true;
-            if ((uName && lowerPos.includes(uName)) || possibleName === '我') isKnown = true;
-            if (possibleName === '系统' || possibleName === '旁白') isKnown = true;
+            if (roleMap && roleMap[lowerPos]) isKnown = true;
+            if (possibleName === '我' || possibleName === '系统' || possibleName === '旁白') isKnown = true;
+            if (cName && lowerPos === cName) isKnown = true;
+            if (uName && lowerPos === uName) isKnown = true;
 
             if (isKnown && !isChapter && !isExcluded) {
-                flush();
+                if (currentText.length > 0) flush();
                 currentSpeaker = possibleName;
                 if (m[2].trim() || m[2] === '') {
                     currentText.push(m[2]);
@@ -404,7 +476,7 @@ function parseTxt(text, opts) {
 /* ═══════════════ JSON 解析 ═══════════════ */
 
 function parseJson(text, opts) {
-    const { charName, userName } = opts;
+    const { charName, userName, addBbsEnd } = opts;
 
     let data;
     try {
@@ -423,6 +495,7 @@ function parseJson(text, opts) {
     if (!arr) return parseTxt(text, opts);
 
     const messages = [];
+    let lastKnownJsonTime = null;
 
     for (const item of arr) {
         if (typeof item === 'string') {
@@ -437,6 +510,54 @@ function parseJson(text, opts) {
             if (!textContent) continue;
         }
 
+        if (addBbsEnd && !item.is_system) {
+            let currentItemTime = null;
+            
+            if (typeof textContent === 'string') {
+                let lines = textContent.split('\n');
+                let mergedLines = [];
+                for (let i = 0; i < lines.length; i++) {
+                    let l = lines[i].trim();
+                    if (/(\d{4})[\.\/\-年]\s*(\d{1,2})[\.\/\-月]\s*(\d{1,2})/.test(l) && l.length < 30) {
+                         let nextIdx = i + 1;
+                         while (nextIdx < lines.length && !lines[nextIdx].trim()) nextIdx++;
+                         if (nextIdx < lines.length) {
+                             let nextLine = lines[nextIdx].trim();
+                             if (/^\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?$/i.test(nextLine)) {
+                                 l = l + ' ' + nextLine;
+                                 i = nextIdx;
+                             }
+                         }
+                    }
+                    mergedLines.push(l);
+                }
+                const mergedContent = mergedLines.join('\n');
+                currentItemTime = extractStandardTime(mergedContent);
+            }
+            
+            if (!currentItemTime && item.time) {
+                currentItemTime = extractStandardTime(item.time);
+            }
+
+            if (currentItemTime) {
+                lastKnownJsonTime = currentItemTime;
+            }
+
+            // 洗旧标签
+            textContent = textContent.replace(/<bbs_start>[\s\S]*?<\/bbs_start>/gi, '').trim();
+            textContent = textContent.replace(/<bbs_end>[\s\S]*?<\/bbs_end>/gi, '').trim();
+
+            // 首尾包裹
+            if (lastKnownJsonTime) {
+                textContent = `<bbs_start>${lastKnownJsonTime}</bbs_start>\n${textContent}\n<bbs_end>${lastKnownJsonTime}</bbs_end>`;
+            }
+        }
+
+        let finalSendDate = item.send_date || nowIso();
+        if (lastKnownJsonTime) {
+            finalSendDate = parse2Iso(lastKnownJsonTime);
+        }
+
         if (item.mes !== undefined && item.name !== undefined) {
             const isUser = item.is_user ?? (item.name === userName);
             let name = item.name;
@@ -446,7 +567,7 @@ function parseJson(text, opts) {
                 name,
                 is_user: !!isUser,
                 is_system: !!item.is_system,
-                send_date: item.send_date || nowIso(),
+                send_date: finalSendDate,
                 mes: String(textContent),
                 extra: item.extra || {}
             });
@@ -460,7 +581,7 @@ function parseJson(text, opts) {
                 name: isUser ? userName : charName,
                 is_user: isUser,
                 is_system: isSystem,
-                send_date: nowIso(),
+                send_date: finalSendDate,
                 mes: String(textContent),
                 extra: {}
             });
@@ -510,16 +631,14 @@ function openModal() {
                         <ul id="cc-file-list" class="cc-file-list"></ul>
                     </div>
                     
-                    <!-- 3000字预览区 -->
                     <div id="cc-preview-file-box" style="display:none; margin-top:10px;">
                         <div style="font-size:12px; color:#aaa; margin-bottom:4px; display:flex; justify-content:space-between;">
                             <span>文件前 3000 字预览：</span>
                             <span style="color:#7bb8ff;">请在此确认格式是否切分正确</span>
                         </div>
-                        <textarea id="cc-file-text-preview" readonly style="width:100%; height:120px; background:rgba(0,0,0,0.3); color:#ccc; font-size:12px; padding:8px; border-radius:6px; border:1px solid rgba(255,255,255,0.1); resize:vertical; white-space:pre-wrap; font-family:monospace;"></textarea>
+                        <textarea id="cc-file-text-preview" readonly style="width:100%; height:120px; background:rgba(0,0,0,0.3); color:#ccc; font-size:12px; padding:8px; border-radius:6px;border:1px solid rgba(255,255,255,0.1); resize:vertical; white-space:pre-wrap; font-family:monospace;"></textarea>
                     </div>
 
-                    <!-- 高频提取标签区 -->
                     <div id="cc-detected-box" style="display:none; margin-top:10px; background:rgba(255,255,255,0.05); padding:8px; border-radius:6px; border:1px solid rgba(255,255,255,0.1);">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                             <span style="font-size:12px; color:#aaa;">提取到的高频发言者（点击标签即可复制）：</span>
@@ -546,21 +665,36 @@ function openModal() {
                         <div class="cc-form-row">
                             <label>未识别文本：</label>
                             <select id="cc-other-speaker" class="text_pole">
-                                <option value="system" selected>作为系统消息（旁白）</option>
+                                <option value="alternate" selected>智能交替</option>
+                                <option value="system">作为系统消息（旁白）</option>
                                 <option value="char">作为角色输出</option>
                                 <option value="user">作为用户输出</option>
                                 <option value="ignore">忽略（直接丢弃）</option>
                             </select>
                         </div>
+                        <div class="cc-form-row">
+                            <label>交替起始角色：</label>
+                            <select id="cc-initial-role" class="text_pole">
+                                <option value="char" selected>角色 (Char) 起始</option>
+                                <option value="user">用户 (User) 起始</option>
+                            </select>
+                        </div>
                         <div class="cc-form-row" style="align-items:flex-start;">
-                            <label style="margin-top:8px;">角色映射表：</label>
+                            <label style="margin-top:8px;">角色映射：</label>
                             <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
-                                <div id="cc-role-map-container" style="display:flex; flex-direction:column; gap:6px;"></div>
-                                <div style="display:flex; gap:8px;">
-                                    <button id="cc-add-role-map" class="menu_button" style="font-size:12px !important;">+ 添加映射</button>
-                                    <button id="cc-auto-detect-roles" class="menu_button" style="font-size:12px !important; color:#7bb8ff;">🔍 自动填充高频角色到映射</button>
+                                <div style="display:flex; gap:8px; align-items:center;">
+                                    <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer;">
+                                        <input type="checkbox" id="cc-manual-role-map"> 手动指定角色映射（默认自动匹配）
+                                    </label>
                                 </div>
-                                <div style="font-size:12px; color:#888;">支持填 <code>&lt;CHAR&gt;</code> 代表角色，填 <code>&lt;USER&gt;</code> 代表你。冒号不用写！</div>
+                                
+                                <div id="cc-role-map-container" style="display:none; flex-direction:column; gap:6px;"></div>
+                                
+                                <div id="cc-role-map-actions" style="display:none; gap:8px;">
+                                    <button id="cc-add-role-map" class="menu_button" style="font-size:12px !important;">+ 添加映射</button>
+                                    <button id="cc-auto-detect-roles" class="menu_button" style="font-size:12px !important; color:#7bb8ff;">🔍 快速填入高频名字</button>
+                                </div>
+                                <div style="font-size:12px; color:#888;">支持填 <code>&lt;CHAR&gt;</code> 代表角色，填 <code>&lt;USER&gt;</code> 代表你。直接粘贴带时间戳的整行也可以自动识别。</div>
                             </div>
                         </div>
                         <div class="cc-form-row">
@@ -592,9 +726,9 @@ function openModal() {
                         <div class="cc-form-row">
                             <label>其他选项：</label>
                             <div class="cc-checkbox-group">
-                                <label><input type="checkbox" id="cc-merge-msgs" checked> <strong style="color:#7bd88f;">自动合并连续的同名消息</strong></label>
                                 <label><input type="checkbox" id="cc-keep-time" checked> 提取并保留时间标记</label>
                                 <label><input type="checkbox" id="cc-detect-markers" checked> 识别 &lt;[时间](名字)&gt; 格式</label>
+                                <label><input type="checkbox" id="cc-add-bbs-end"> <strong style="color:#7bb8ff;">适配 BBS（首尾换行包裹 &lt;bbs_start&gt; 和 &lt;bbs_end&gt; 标签）</strong></label>
                             </div>
                         </div>
                     </div>
@@ -618,10 +752,6 @@ function openModal() {
 
     jQuery('body').append(html);
     bindModalEvents();
-    
-    // 默认只加两个
-    addRoleMapRow('<CHAR>', 'char');
-    addRoleMapRow('<USER>', 'user');
 }
 
 function generateRuleRowHtml(start, end) {
@@ -685,7 +815,8 @@ function bindRuleRowEvents(row) {
         if (matches.size === 0) { toastr?.info('未检测到标签'); return; }
         
         const tags = Array.from(matches).sort();
-        const overlay = jQuery('<div style="position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(2px);z-index:100000;display:flex;align-items:center;justify-content:center;padding:20px;"></div>');
+        // 使用极高 z-index 和 fixed 定位，确保绝对在顶层
+        const overlay = jQuery('<div style="position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.6);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:20px;"></div>');
         const box = jQuery('<div style="background:#1e1e1e;border:1px solid #555;border-radius:12px;padding:20px;max-height:80vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px;min-width:320px;max-width:400px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,0.8);"></div>');
         
         box.append('<div style="font-weight:bold; margin-bottom:8px; color:#7bb8ff; font-size:15px;">检测到的标签（点击填入）</div>');
@@ -708,7 +839,7 @@ function bindRuleRowEvents(row) {
         box.append(closeBtn);
         
         overlay.append(box);
-        jQuery('body').append(overlay);
+        jQuery('body').append(overlay); // 必须追加到 body 最外层
     });
 }
 
@@ -738,7 +869,6 @@ function bindModalEvents() {
     
     jQuery('#cc-file-input').on('change', e => handleFiles(e.target.files));
 
-    // 点击提取的标签复制
     jQuery('#cc-detected-tags').on('click', '.cc-tag-item', function() {
         const name = jQuery(this).data('name');
         navigator.clipboard.writeText(name).then(() => {
@@ -748,7 +878,21 @@ function bindModalEvents() {
         });
     });
 
-    // 一键生成映射
+    // 映射表显示与隐藏逻辑
+    jQuery('#cc-manual-role-map').on('change', function() {
+        if (this.checked) {
+            jQuery('#cc-role-map-container').css('display', 'flex');
+            jQuery('#cc-role-map-actions').css('display', 'flex');
+            if (jQuery('#cc-role-map-container').children().length === 0) {
+                addRoleMapRow('<CHAR>', 'char');
+                addRoleMapRow('<USER>', 'user');
+            }
+        } else {
+            jQuery('#cc-role-map-container').hide();
+            jQuery('#cc-role-map-actions').hide();
+        }
+    });
+
     jQuery('#cc-auto-detect-roles').on('click', () => {
         if (!extractedNames.length) {
             toastr?.warning('请先选择文件，系统尚未提取到高频名字');
@@ -864,23 +1008,19 @@ async function handleFiles(fileList) {
     document.getElementById('cc-preview').innerHTML = '<p class="cc-placeholder">转换后在此预览…</p>';
     document.getElementById('cc-stats').textContent = '';
     
-    // 提取高频名字 & 3000字预览
     if (hasFiles) {
         const file = pendingFiles[0];
         const text = await file.text();
         
-        // 预览框
         jQuery('#cc-preview-file-box').show();
         jQuery('#cc-file-text-preview').val(text.substring(0, 3000) + (text.length > 3000 ? '\n\n...[内容已截断，完整内容将被转换]' : ''));
         
-        // 高频词提取
         extractedNames = extractNamesFromText(text);
         const tagsContainer = jQuery('#cc-detected-tags');
         tagsContainer.empty();
         
         if (extractedNames.length > 0) {
             jQuery('#cc-detected-box').show();
-            // 只展示前 20 个高频词，避免太长
             extractedNames.slice(0, 20).forEach(name => {
                 const tag = jQuery(`<span class="cc-tag-item" data-name="${escapeHtml(name)}" style="background:rgba(123,184,255,0.15); color:#7bb8ff; border:1px solid rgba(123,184,255,0.3); padding:2px 8px; border-radius:12px; font-size:12px; cursor:pointer; user-select:none;" title="点击复制">${escapeHtml(name)}</span>`);
                 tagsContainer.append(tag);
@@ -899,24 +1039,34 @@ async function convertAll() {
     const charName = jQuery('#cc-char-name').val().trim();
     const userName = jQuery('#cc-user-name').val().trim();
     const otherMode = jQuery('#cc-other-speaker').val();
+    const initialRole = jQuery('#cc-initial-role').val();
     const detectMarkers = jQuery('#cc-detect-markers').is(':checked');
     const keepTime = jQuery('#cc-keep-time').is(':checked');
+    const addBbsEnd = jQuery('#cc-add-bbs-end').is(':checked');
     
     const removeType = jQuery('#cc-remove-type').val();
     const removeText = jQuery('#cc-remove-text').is(':checked');
     
-    // 收集角色映射表，并清洗冒号和空格！
     const roleMap = {};
-    jQuery('#cc-role-map-container .cc-role-map-row').each(function () {
-        let match = jQuery(this).find('.cc-map-match').val().trim();
-        const role = jQuery(this).find('.cc-map-role').val();
-        if (match) {
-            // 清洗末尾冒号
-            match = match.replace(/[：:]\s*$/, '').trim();
-            match = match.replace(/<CHAR>/gi, charName).replace(/<USER>/gi, userName);
-            roleMap[match.toLowerCase()] = role;
-        }
-    });
+    // 只有当手动勾选时，才读取映射
+    if (jQuery('#cc-manual-role-map').is(':checked')) {
+        jQuery('#cc-role-map-container .cc-role-map-row').each(function () {
+            let match = jQuery(this).find('.cc-map-match').val().trim();
+            const role = jQuery(this).find('.cc-map-role').val();
+            if (match) {
+                match = match.replace(/[：:]\s*$/, '').trim();
+                
+                // 【核心修复】：如果用户直接粘贴了完整的 <[时间](名字)>，自动剥壳提取名字
+                const matchMarker = match.match(/^<\[(.*?)\]\((.*?)\)>\s*(.*)$/);
+                if (matchMarker) {
+                    match = matchMarker[2].trim();
+                }
+
+                match = match.replace(/<CHAR>/gi, charName).replace(/<USER>/gi, userName);
+                roleMap[cleanNameForMatch(match)] = role;
+            }
+        });
+    }
 
     const removeRules = [];
     jQuery('#cc-custom-rules-container .cc-rule-row').each(function () {
@@ -936,7 +1086,7 @@ async function convertAll() {
     if (!userName) { toastr?.error('请填写用户名称'); return; }
     if (!pendingFiles.length) { toastr?.error('请先选择文件'); return; }
 
-    const opts = { charName, userName, otherMode, detectMarkers, keepTime, removeType, removeText, removeRules, keepRules, roleMap };
+    const opts = { charName, userName, otherMode, initialRole, detectMarkers, keepTime, removeType, removeText, removeRules, keepRules, roleMap, addBbsEnd };
     convertedMessages = [];
 
     for (const file of pendingFiles) {
@@ -950,6 +1100,7 @@ async function convertAll() {
             toastr?.error(`解析 ${file.name} 失败：${err.message}`);
             continue;
         }
+        
         convertedMessages.push(...msgs);
     }
 
